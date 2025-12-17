@@ -8,13 +8,15 @@ import os
 import requests
 import tempfile
 import gzip
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 
 app = FastAPI(title="GRIB2 Parser Service", version="1.0.0")
 
-SAMPLE_RATE = int(os.getenv('SAMPLE_RATE', '10')) 
-CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '1000'))
+# Configuration
+SAMPLE_RATE = int(os.getenv('SAMPLE_RATE', '20'))  # More aggressive sampling for 512MB
+CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '500'))   # Smaller chunks for memory
+MAX_POINTS = int(os.getenv('MAX_POINTS', '5000'))  # Hard limit on points returned
 
 class RadarPoint(BaseModel):
     lat: float
@@ -32,165 +34,167 @@ async def root():
 
 class ParseRequest(BaseModel):
     url: str
+    bounds: Optional[Dict[str, float]] = None  # Optional geographic bounds
 
 @app.post("/parse", response_model=ParsedData)
 async def parse_grib2(request: ParseRequest):
     """
     Download and parse GRIB2 file from URL and return radar data points
+    Memory optimized for 512MB servers
     """
     try:
         url = request.url
+        bounds = request.bounds
+        
+        print(f"Starting memory-optimized GRIB2 parsing...")
+        print(f"Sample rate: {SAMPLE_RATE}, Chunk size: {CHUNK_SIZE}, Max points: {MAX_POINTS}")
         
         with tempfile.NamedTemporaryFile(suffix='.grib2', delete=False) as temp_file:
             file_path = temp_file.name
-            
             
             print(f"Downloading MRMS data from {url}...")
             response = requests.get(url, timeout=60)
             response.raise_for_status()
             
-            
             if url.endswith('.gz'):
+                print("Decompressing gzip file...")
                 decompressed_data = gzip.decompress(response.content)
                 temp_file.write(decompressed_data)
             else:
                 temp_file.write(response.content)
             temp_file.flush()
-            
-            print(f"Downloaded and saved to {file_path}")
         
         try:
+            print("Opening GRIB2 file with cfgrib...")
             ds = xr.open_dataset(file_path, engine='cfgrib')
-        
-            print(f"Available variables: {list(ds.data_vars.keys())}")
-            print(f"Dimensions: {dict(ds.dims)}")
             
-            reflectivity_var = None
-            possible_names = ['REFC', 'refc', 'Reflectivity', 'reflectivity', 'DBZ', 'dbz']
-            
-            for var_name in possible_names:
-                if var_name in ds.data_vars:
-                    reflectivity_var = var_name
+            # Get the reflectivity variable
+            var_name = None
+            for var in ds.data_vars:
+                if 'refl' in var.lower() or 'reflectivity' in var.lower():
+                    var_name = var
                     break
             
-            if reflectivity_var is None:
-                if ds.data_vars:
-                    reflectivity_var = list(ds.data_vars.keys())[0]
-                    print(f"Using variable: {reflectivity_var}")
-                else:
-                    raise HTTPException(status_code=400, detail="No data variables found in GRIB2 file")
+            if not var_name:
+                # Try to find any numeric variable
+                for var in ds.data_vars:
+                    if ds[var].dtype.kind in ['f', 'i']:  # float or integer
+                        var_name = var
+                        break
             
-            print(f"Using variable: {reflectivity_var}")
+            if not var_name:
+                raise HTTPException(status_code=500, detail="No suitable data variable found")
             
-            data = ds[reflectivity_var].values
+            data = ds[var_name].values
+            lat = ds['latitude'].values
+            lon = ds['longitude'].values
             
-            try:
-                lat = ds.latitude.values
-                lon = ds.longitude.values
-            except AttributeError:
-                lat = ds.lat.values if 'lat' in ds else ds.y.values
-                lon = ds.lon.values if 'lon' in ds else ds.x.values
+            print(f"Data shape: {data.shape}, Memory usage: {data.nbytes / 1024 / 1024:.1f} MB")
             
-            print(f"Data shape: {data.shape}, Lat shape: {lat.shape}, Lon shape: {lon.shape}")
-            print(f"Data range: {np.nanmin(data)} to {np.nanmax(data)}")
-            print(f"Lat range: {np.min(lat)} to {np.max(lat)}")
-            print(f"Lon range: {np.min(lon)} to {np.max(lon)}")
+            # Apply geographic bounds if provided
+            lat_min, lat_max, lon_min, lon_max = -90, 90, -180, 180
+            if bounds:
+                lat_min = bounds.get('south', -90)
+                lat_max = bounds.get('north', 90)
+                lon_min = bounds.get('west', -180)
+                lon_max = bounds.get('east', 180)
+                print(f"Using bounds: {lat_min} to {lat_max}, {lon_min} to {lon_max}")
             
-        
-            lon_grid, lat_grid = np.meshgrid(lon, lat)
+            # Convert longitude from 0-360 to -180-180 if needed
+            if np.max(lon) > 180:
+                lon = np.where(lon > 180, lon - 360, lon)
             
+            # Create valid mask with bounds
+            valid_mask = (
+                (data > 0) &  # Only positive reflectivity values
+                (~np.isnan(data)) &  # Remove NaN values
+                (lat >= lat_min) & (lat <= lat_max) & 
+                (lon >= lon_min) & (lon <= lon_max)
+            )
             
-            
-            valid_mask = ~np.isnan(data) & (data != -999) & (data >= -10) & (data <= 80)
-            
-            
-            
-            lat_min, lat_max = 25, 50
-            lon_min, lon_max = -125, -65
-            
-            
-            if np.min(lon) >= 0:
-                
-                lon_grid = np.where(lon_grid > 180, lon_grid - 360, lon_grid)
-                print("Converted longitude from 0-360 to -180-180 range")
-            
-            
-            valid_mask &= (lat_grid >= lat_min) & (lat_grid <= lat_max) & (lon_grid >= lon_min) & (lon_grid <= lon_max)
-            
-            print(f"Valid points found: {np.sum(valid_mask)}")
+            total_valid = np.sum(valid_mask)
+            print(f"Valid points found: {total_valid}")
             
             points = []
-            if np.sum(valid_mask) > 0:
-            
+            if total_valid > 0:
+                # Get indices of valid points
                 valid_indices = np.where(valid_mask)
-                total_points = len(valid_indices[0])
                 
-                print(f"Processing {total_points} points in chunks of {CHUNK_SIZE}")
+                # Calculate effective sampling rate to stay within MAX_POINTS
+                effective_sample_rate = max(1, total_valid // MAX_POINTS)
+                final_sample_rate = max(SAMPLE_RATE, effective_sample_rate)
                 
+                print(f"Using sample rate: {final_sample_rate} (effective: {effective_sample_rate})")
+                
+                # Process in very small chunks for memory efficiency
                 chunk_count = 0
-                for chunk_start in range(0, total_points, CHUNK_SIZE):
-                    chunk_end = min(chunk_start + CHUNK_SIZE, total_points)
-                    chunk_indices = range(chunk_start, chunk_end, SAMPLE_RATE)
+                for chunk_start in range(0, total_valid, CHUNK_SIZE):
+                    chunk_end = min(chunk_start + CHUNK_SIZE, total_valid)
                     
-                    chunk_points = []
-                    for i in chunk_indices:
+                    # Sample within this chunk
+                    for i in range(chunk_start, min(chunk_end, total_valid), final_sample_rate):
+                        if len(points) >= MAX_POINTS:
+                            break
+                            
                         row_idx = valid_indices[0][i]
                         col_idx = valid_indices[1][i]
                         
-                        lat_val = float(lat_grid[row_idx, col_idx])
-                        lon_val = float(lon_grid[row_idx, col_idx])
+                        lat_val = float(lat[row_idx, col_idx])
+                        lon_val = float(lon[row_idx, col_idx])
                         value_val = float(data[row_idx, col_idx])
                         
-                        chunk_points.append({
+                        points.append({
                             "lat": lat_val,
                             "lon": lon_val,
                             "value": value_val
                         })
                     
-                    points.extend(chunk_points)
                     chunk_count += 1
                     
-                    if chunk_count % 10 == 0:  # Log every 10 chunks
-                        print(f"Processed {chunk_count} chunks, {len(points)} points so far")
+                    # Memory cleanup
+                    if chunk_count % 5 == 0:
+                        import gc
+                        gc.collect()
+                        print(f"Processed chunk {chunk_count}, points so far: {len(points)}")
+                    
+                    if len(points) >= MAX_POINTS:
+                        break
                 
-                print(f"Final result: {len(points)} points from {total_points} total points (1 in {SAMPLE_RATE})")
+                print(f"Final result: {len(points)} points from {total_valid} total points")
             
-            
+            # Calculate bounds from actual data
             if points:
                 lats = [p["lat"] for p in points]
                 lons = [p["lon"] for p in points]
-                bounds = {
+                data_bounds = {
                     "north": max(lats),
                     "south": min(lats),
                     "east": max(lons),
                     "west": min(lons)
                 }
             else:
-                
-                bounds = {
-                    "north": 50,
-                    "south": 25,
-                    "east": -65,
-                    "west": -125
-                }
+                data_bounds = {"north": 0, "south": 0, "east": 0, "west": 0}
             
+            # Get timestamp from dataset
+            timestamp = str(ds.time.values[0]) if 'time' in ds else "unknown"
             
-            timestamp = ds.get('time', 'unknown').__str__() if 'time' in ds else "unknown"
+            # Cleanup dataset to free memory
+            ds.close()
+            import gc
+            gc.collect()
             
-            return ParsedData(
-                points=points,
-                bounds=bounds,
-                timestamp=timestamp
-            )
-        
+            return ParsedData(points=points, bounds=data_bounds, timestamp=timestamp)
+            
         except Exception as e:
             if 'file_path' in locals() and os.path.exists(file_path):
                 os.unlink(file_path)
             raise HTTPException(status_code=500, detail=f"Error parsing GRIB2 file: {str(e)}")
-    
-    finally:
-        if 'file_path' in locals() and os.path.exists(file_path):
-            os.unlink(file_path)
+        finally:
+            if 'file_path' in locals() and os.path.exists(file_path):
+                os.unlink(file_path)
+                
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
 
 @app.get("/health")
 async def health_check():
