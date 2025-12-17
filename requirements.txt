@@ -1,6 +1,7 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-cfgrib==0.9.10.4
-xarray==2023.11.0
-numpy==1.24.3
-pydantic==2.5.0
+fastapi
+uvicorn
+cfgrib
+xarray
+numpy
+pydantic
+requests

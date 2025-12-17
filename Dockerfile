@@ -17,6 +17,10 @@ COPY . .
 # Create cache directory
 RUN mkdir -p /app/cache
 
+# Set default environment variables
+ENV SAMPLE_RATE=10
+ENV CHUNK_SIZE=1000
+
 EXPOSE 8000
 
 # Start the service
