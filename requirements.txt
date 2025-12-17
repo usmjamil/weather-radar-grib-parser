@@ -1,7 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 cfgrib
 xarray
 numpy
 pydantic
 requests
+gunicorn
