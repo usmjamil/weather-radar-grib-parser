@@ -6,3 +6,5 @@ numpy
 pydantic
 requests
 gunicorn
+dask
+cfgrib
